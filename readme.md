@@ -1,8 +1,8 @@
-### \### PrintSim
+### PrintSim
 
 PrintSim is a command-line script that allows you to turn any standard GCode (Marlinn compatible, haven't tested any other flavors of gcode) and turns it into a .wav file so you can hear the sounds as if coming through a real 3d printer
 
-### \### features
+### features
 
 Stepper motor sound modelling
 4 fan sounds (Mainboard, PSU, Hotend and Part-Cooling fan)
