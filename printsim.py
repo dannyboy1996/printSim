@@ -38,7 +38,7 @@ class ResonanceFilter:
             output += y * f['gain']
         return output
 
-# --- FAN SIMULATION MODEL ---
+# --- FAN SIMULATION MODEL (MODIFIED FOR PHASE CONTINUITY) ---
 class Fan:
     """Simulates a single fan with realistic spin-up and spin-down."""
     def __init__(self, sample_rate, ramp_time=1.5, base_blade_freq=80, vol=1.0, base_pitch=1.0):
@@ -49,8 +49,8 @@ class Fan:
         self.vol = vol
         self.current_speed = 0.0
         self.target_speed = 0.0
-        # --- FIX 1: Initialize state as a NumPy array ---
-        self._noise_z = np.array([0.0])
+        self._noise_z = [0.0]  # State for the brown noise filter
+        self.phase_accumulator = 0.0  # ADDED: To maintain phase continuity for the hum
 
     def set_speed(self, speed_percent):
         self.target_speed = np.clip(speed_percent, 0.0, 1.0)
@@ -72,13 +72,15 @@ class Fan:
         
         white_noise = np.random.randn(num_samples).astype(np.float32)
         avg_alpha = np.mean(0.995 - (speed_profile * 0.1))
-        # --- FIX 2: Pass state directly without wrapping it in a list ---
         brown_noise, self._noise_z = lfilter([1 - avg_alpha], [1, -avg_alpha], white_noise, zi=self._noise_z)
 
-        t = np.linspace(0, num_samples / self.sample_rate, num_samples, endpoint=False)
+        # --- MODIFIED PHASE CALCULATION ---
         blade_freq_profile = self.base_blade_freq * (0.5 + speed_profile * 0.5)
-        phase = np.cumsum(2 * np.pi * blade_freq_profile / self.sample_rate)
+        phase_increments = 2 * np.pi * blade_freq_profile / self.sample_rate
+        phase = self.phase_accumulator + np.cumsum(phase_increments)
         fan_hum = 0.2 * np.sin(phase)
+        self.phase_accumulator = phase[-1] % (2 * np.pi)
+        # --- END MODIFICATION ---
         
         final_noise = (brown_noise * 0.8 + fan_hum) * volume_profile
         return final_noise.astype(np.float32)
@@ -181,15 +183,16 @@ def gcode_to_audio(gcode_file, output_file, sample_rate=44100):
     part_cooling_fan = Fan(sample_rate, ramp_time=1.5, base_blade_freq=100, vol=0.25, base_pitch=1.1)
     psu_fan.set_speed(1.0)
     mainboard_fan.set_speed(1.0)
+    hotend_fan_start_time = first_heat_time if first_heat_time >= 0 else total_duration
     
     events.sort(key=lambda x: x['start_time'])
     
     print("Pre-rendering motor sounds with dedicated panning...")
-    # This loop remains memory-intensive, but we will trust the user's preference for now
-    # as the fan synthesis was the main topic of the crash.
     last_phases = {'X': 0.0, 'Y': 0.0, 'Z': 0.0, 'E': 0.0}
 
-    for event in tqdm([e for e in events if e['type'] == 'move'], unit='evt'):
+    for event in tqdm(events, unit='evt'):
+        if event['type'] != 'move': continue
+        
         start_sample = int(event['start_time'] * sample_rate)
         num_samples_seg = int(event['duration'] * sample_rate)
         end_sample = start_sample + num_samples_seg
@@ -217,62 +220,86 @@ def gcode_to_audio(gcode_file, output_file, sample_rate=44100):
             axis_v_profile = v_profile * (abs(axis_delta) / total_dist)
             return initial_phase + np.cumsum(2 * np.pi * (base_freq + axis_v_profile * 10) / sample_rate)
 
-        phase_y = get_phase(delta.get('Y'), 75, last_phases['Y']); raw_y = generate_stepper_waveform(phase_y) * motor_vol if delta.get('Y') else np.zeros(num_samples_seg); last_phases['Y'] = phase_y[-1] % (2 * np.pi)
-        phase_z = get_phase(delta.get('Z'), 35, last_phases['Z']); raw_z = generate_stepper_waveform(phase_z) * motor_vol if delta.get('Z') else np.zeros(num_samples_seg); last_phases['Z'] = phase_z[-1] % (2 * np.pi)
-        phase_e = get_phase(delta.get('E'), 150, last_phases['E']); raw_e = generate_extruder_waveform(phase_e) * extruder_vol if delta.get('E') else np.zeros(num_samples_seg); last_phases['E'] = phase_e[-1] % (2 * np.pi)
+        phase_y = get_phase(delta.get('Y'), 75, last_phases['Y'])
+        raw_y = generate_stepper_waveform(phase_y) * motor_vol if delta.get('Y') else np.zeros(num_samples_seg)
+        last_phases['Y'] = phase_y[-1] % (2 * np.pi)
+        
+        phase_z = get_phase(delta.get('Z'), 35, last_phases['Z'])
+        raw_z = generate_stepper_waveform(phase_z) * motor_vol if delta.get('Z') else np.zeros(num_samples_seg)
+        last_phases['Z'] = phase_z[-1] % (2 * np.pi)
+
+        phase_e = get_phase(delta.get('E'), 150, last_phases['E'])
+        raw_e = generate_extruder_waveform(phase_e) * extruder_vol if delta.get('E') else np.zeros(num_samples_seg)
+        last_phases['E'] = phase_e[-1] % (2 * np.pi)
 
         centered_mono = raw_y + raw_z + raw_e
         final_audio[start_sample:end_sample, 0] += centered_mono
         final_audio[start_sample:end_sample, 1] += centered_mono
 
         if delta.get('X'):
-            phase_x = get_phase(delta.get('X'), 70, last_phases['X']); raw_x = generate_stepper_waveform(phase_x) * motor_vol; last_phases['X'] = phase_x[-1] % (2 * np.pi)
-            start_pos_x = details['start_pos']['X']; end_pos_x = start_pos_x + delta.get('X', 0)
-            start_pan = np.clip(start_pos_x / BED_SIZE['X'], 0.1, 0.9); end_pan = np.clip(end_pos_x / BED_SIZE['X'], 0.1, 0.9)
+            phase_x = get_phase(delta.get('X'), 70, last_phases['X'])
+            raw_x = generate_stepper_waveform(phase_x) * motor_vol
+            last_phases['X'] = phase_x[-1] % (2 * np.pi)
+
+            start_pos_x = details['start_pos']['X']
+            end_pos_x = start_pos_x + delta.get('X', 0)
+            start_pan = np.clip(start_pos_x / BED_SIZE['X'], 0.1, 0.9)
+            end_pan = np.clip(end_pos_x / BED_SIZE['X'], 0.1, 0.9)
             pan_profile = np.linspace(start_pan, end_pan, num_samples_seg)
+
             final_audio[start_sample:end_sample, 0] += raw_x * (1 - pan_profile)
             final_audio[start_sample:end_sample, 1] += raw_x * pan_profile
     
-    print("Applying resonance and mixing fans...")
-    final_audio[:, 0] += resonance_model.process(final_audio[:, 0])
-    final_audio[:, 1] += resonance_model.process(final_audio[:, 1])
-    
+    # --- MODIFIED: MEMORY-EFFICIENT MIXING LOOP ---
+    print("Synthesizing fans, applying resonance, and mixing...")
     event_idx = 0
+    chunk_size = 4096 # Process in chunks to save memory
     with tqdm(total=total_samples, unit='samp') as pbar:
-        for current_sample in range(0, total_samples, 1024):
-            chunk_size = min(1024, total_samples - current_sample)
+        for current_sample in range(0, total_samples, chunk_size):
+            end_sample = min(current_sample + chunk_size, total_samples)
+            num_samples_in_chunk = end_sample - current_sample
             
-            while event_idx < len(events) and events[event_idx]['start_time'] * sample_rate < current_sample + chunk_size:
+            # Get a VIEW of the motor audio for this chunk. This does not copy memory.
+            chunk_slice = final_audio[current_sample:end_sample]
+            
+            # Check for fan events that occur within this time window
+            while event_idx < len(events) and int(events[event_idx]['start_time'] * sample_rate) < end_sample:
                 event = events[event_idx]
-                evt_type = event['type']
-                if evt_type == 'fan_speed':
+                if event['type'] == 'fan_speed':
                     part_cooling_fan.set_speed(event['details']['speed'])
-                elif evt_type == 'move' and 'hotend_temp' in event: # Placeholder for future logic
-                    pass 
-                event_idx +=1
+                event_idx += 1
             
-            if first_heat_time != -1 and current_sample / sample_rate >= first_heat_time and hotend_fan.target_speed == 0:
+            # Check if hotend fan should turn on
+            if current_sample / sample_rate >= hotend_fan_start_time and hotend_fan.target_speed == 0:
                 hotend_fan.set_speed(1.0)
 
-            mixed_fans = (psu_fan.generate_audio(chunk_size) + 
-                          mainboard_fan.generate_audio(chunk_size) + 
-                          hotend_fan.generate_audio(chunk_size) + 
-                          part_cooling_fan.generate_audio(chunk_size))
+            # Generate fan audio for just this chunk (phase is maintained by the Fan class)
+            mixed_fans = (psu_fan.generate_audio(num_samples_in_chunk) + 
+                          mainboard_fan.generate_audio(num_samples_in_chunk) + 
+                          hotend_fan.generate_audio(num_samples_in_chunk) + 
+                          part_cooling_fan.generate_audio(num_samples_in_chunk))
             
-            final_audio[current_sample : current_sample + chunk_size, 0] += mixed_fans
-            final_audio[current_sample : current_sample + chunk_size, 1] += mixed_fans
-            pbar.update(chunk_size)
+            # Add fans to the existing motor sounds IN-PLACE
+            chunk_slice[:, 0] += mixed_fans
+            chunk_slice[:, 1] += mixed_fans
+            
+            # Apply resonance filter IN-PLACE on the slice.
+            # The filter is stateful, so it works correctly across chunks.
+            # This avoids creating a massive new array for the filtered output.
+            chunk_slice[:, 0] += resonance_model.process(chunk_slice[:, 0])
+            chunk_slice[:, 1] += resonance_model.process(chunk_slice[:, 1])
+
+            pbar.update(num_samples_in_chunk)
 
     print("Mastering audio and saving...")
     final_audio *= master_gain
     np.clip(final_audio, -1.0, 1.0, out=final_audio)
-    safe_audio = np.nan_to_num(final_audio) # Sanitize just in case
     
     with wave.open(output_file, 'wb') as wf:
         wf.setnchannels(2)
         wf.setsampwidth(2)
         wf.setframerate(sample_rate)
-        wf.writeframes((safe_audio * 32767).astype(np.int16).tobytes())
+        wf.writeframes((final_audio * 32767).astype(np.int16).tobytes())
     print("Conversion complete.")
 
 if __name__ == '__main__':
