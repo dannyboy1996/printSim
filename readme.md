@@ -8,5 +8,9 @@ Stepper motor sound modelling
 4 fan sounds (Mainboard, PSU, Hotend and Part-Cooling fan)
 Resonance of the print bed
 
+\### usage
+
+python printsim.py <your\_gcode.gcode>
+
 Please feel free to make a pull request to help add more features or to improve on the code
 

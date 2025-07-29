@@ -175,7 +175,7 @@ def gcode_to_audio(gcode_file, output_file, sample_rate=44100):
     final_audio = np.zeros((total_samples, 2), dtype=np.float32)
     
     resonance_model = ResonanceFilter(sample_rate)
-    motor_vol, extruder_vol, master_gain = 0.9, 0.55, 1.6
+    motor_vol, extruder_vol, master_gain = 0.75, 0.55, 0.5
 
     psu_fan = Fan(sample_rate, ramp_time=3.0, base_blade_freq=70, vol=0.15, base_pitch=0.8)
     mainboard_fan = Fan(sample_rate, ramp_time=3.0, base_blade_freq=90, vol=0.12, base_pitch=1.0)
