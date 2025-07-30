@@ -1,3 +1,5 @@
+
+
 \# PrintSim
 
 
@@ -20,13 +22,13 @@
 
 
 
-  \* Mainboard fan
+&nbsp; \* Mainboard fan
 
-  \* PSU fan
+&nbsp; \* PSU fan
 
-  \* Hotend fan
+&nbsp; \* Hotend fan
 
-  \* Part-cooling fan
+&nbsp; \* Part-cooling fan
 
 \* Print bed resonance modeling for realistic depth and texture
 
@@ -42,7 +44,7 @@
 
 ```cmd
 
-python printsim.py your\\\_gcode\\\_file.gcode
+python printsim.py your\_gcode\_file.gcode
 
 ```
 
@@ -65,6 +67,4 @@ This will generate a `.wav` file simulating your print.
 \* More accurate emulation of part-cooling fan spin-up/spin-down behavior, like on real printers
 
 Please feel free to submit a pull-request with more features
-
-
 
