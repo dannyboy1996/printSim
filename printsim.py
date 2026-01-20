@@ -2,7 +2,8 @@ import argparse
 import math
 import wave
 import numpy as np
-from gcodeparser import GcodeParser
+import io
+from gcodeparser import parse_gcode_lines
 from tqdm import tqdm
 from scipy.signal import butter, lfilter
 
@@ -109,8 +110,8 @@ def gcode_to_audio(gcode_file, output_file, sample_rate=44100):
         with open(gcode_file, 'r') as f: gcode = f.read()
     except FileNotFoundError: print(f"Error: The file '{gcode_file}' was not found."); return
 
-    parser = GcodeParser(gcode)
-    lines = parser.lines
+    gcode_io = io.StringIO(gcode)
+    lines = parse_gcode_lines(gcode_io)
     events = []
     last_pos = {'X': BED_SIZE['X']/2, 'Y': BED_SIZE['Y']/2, 'Z': BED_SIZE['Z']/2, 'E': 0}
     total_duration = 0
