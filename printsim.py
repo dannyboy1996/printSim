@@ -1,6 +1,6 @@
 import argparse
 import math
-import wave
+import soundfile as sf
 import numpy as np
 import io
 from gcodeparser import parse_gcode_lines
@@ -293,14 +293,21 @@ def gcode_to_audio(gcode_file, output_file, sample_rate=44100):
             pbar.update(num_samples_in_chunk)
 
     print("Mastering audio and saving...")
-    final_audio *= master_gain
-    np.clip(final_audio, -1.0, 1.0, out=final_audio)
-    
-    with wave.open(output_file, 'wb') as wf:
-        wf.setnchannels(2)
-        wf.setsampwidth(2)
-        wf.setframerate(sample_rate)
-        wf.writeframes((final_audio * 32767).astype(np.int16).tobytes())
+    try:
+        with sf.SoundFile(output_file, 'w', samplerate=sample_rate, channels=2, subtype='PCM_16', format='RF64') as f:
+            chunk_size = 65536
+            for i in tqdm(range(0, total_samples, chunk_size), desc="Mastering and Writing WAV"):
+                end = min(i + chunk_size, total_samples)
+                chunk = final_audio[i:end]
+                
+                chunk *= master_gain
+                np.clip(chunk, -1.0, 1.0, out=chunk)
+                
+                f.write(chunk)
+    except Exception as e:
+        print(f"An error occurred during file writing: {e}")
+        return
+
     print("Conversion complete.")
 
 if __name__ == '__main__':
