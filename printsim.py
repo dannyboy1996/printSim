@@ -39,19 +39,51 @@ class ResonanceFilter:
             output += y * f['gain']
         return output
 
-# --- FAN SIMULATION MODEL (MODIFIED FOR PHASE CONTINUITY) ---
+# --- FAN CASING RESONANCE MODEL ---
+class FanCasingFilter:
+    """A bank of resonant filters to simulate a fan's casing affecting airflow sound."""
+    def __init__(self, sample_rate, filter_params):
+        if not filter_params:
+            self.filters = []
+            return
+        # A list of tuples: (frequency, Q-factor, gain)
+        self.filters = [self._create_filter(freq, Q, gain, sample_rate) for freq, Q, gain in filter_params]
+
+    def _create_filter(self, freq, Q, gain, fs):
+        nyquist = 0.5 * fs
+        low = max(1, freq - freq / (2 * Q))
+        high = min(nyquist - 1, freq + freq / (2 * Q))
+        if low >= high: high = low + 1
+        b, a = butter(2, [low, high], btype='band', fs=fs)
+        return {'b': b, 'a': a, 'gain': gain, 'z': np.zeros(max(len(a), len(b)) - 1)}
+
+    def process(self, signal):
+        if not self.filters:
+            return np.zeros_like(signal)
+        output = np.zeros_like(signal)
+        for f in self.filters:
+            y, f['z'] = lfilter(f['b'], f['a'], signal, zi=f['z'])
+            output += y * f['gain']
+        return output
+
+# --- MATHEMATICAL FAN SIMULATION MODEL ---
 class Fan:
-    """Simulates a single fan with realistic spin-up and spin-down."""
-    def __init__(self, sample_rate, ramp_time=1.5, base_blade_freq=80, vol=1.0, base_pitch=1.0):
+    """Simulates a fan based on mathematical principles: RPM, blade count, and casing resonance."""
+    def __init__(self, sample_rate, ramp_time=1.5, num_blades=7, max_rpm=4000, vol=1.0, pitch_variation=0.05, casing_filter_params=None, hum_to_noise_ratio=0.3):
         self.sample_rate = sample_rate
         self.ramp_time = ramp_time
-        self.base_blade_freq = base_blade_freq
-        self.base_pitch = base_pitch
+        self.num_blades = num_blades
+        self.max_rpm = max_rpm
         self.vol = vol
-        self.current_speed = 0.0
+        self.pitch_variation = pitch_variation
+        self.hum_to_noise_ratio = hum_to_noise_ratio
+
+        self.casing_filter = FanCasingFilter(sample_rate, casing_filter_params)
+        self._noise_z_fallback = np.zeros(3) # Fallback if no casing filter
+
+        self.current_speed = 0.0  # Normalized speed (0 to 1)
         self.target_speed = 0.0
-        self._noise_z = [0.0]  # State for the brown noise filter
-        self.phase_accumulator = 0.0  # ADDED: To maintain phase continuity for the hum
+        self.phase_accumulator = 0.0
 
     def set_speed(self, speed_percent):
         self.target_speed = np.clip(speed_percent, 0.0, 1.0)
@@ -60,30 +92,47 @@ class Fan:
         if self.current_speed == 0 and self.target_speed == 0:
             return np.zeros(num_samples, dtype=np.float32)
 
+        # Calculate speed profile for smooth transitions
         ramp_amount_per_second = 1.0 / self.ramp_time if self.ramp_time > 0 else float('inf')
         max_ramp_change = ramp_amount_per_second * (num_samples / self.sample_rate)
-
         start_speed = self.current_speed
         end_speed = self.current_speed + np.clip(self.target_speed - self.current_speed, -max_ramp_change, max_ramp_change)
-        
         speed_profile = np.linspace(start_speed, end_speed, num_samples)
         self.current_speed = end_speed
 
         volume_profile = speed_profile * self.vol
-        
-        white_noise = np.random.randn(num_samples).astype(np.float32)
-        avg_alpha = np.mean(0.995 - (speed_profile * 0.1))
-        brown_noise, self._noise_z = lfilter([1 - avg_alpha], [1, -avg_alpha], white_noise, zi=self._noise_z)
+        rpm_profile = self.max_rpm * speed_profile
 
-        # --- MODIFIED PHASE CALCULATION ---
-        blade_freq_profile = self.base_blade_freq * (0.5 + speed_profile * 0.5)
+        # 1. Airflow Noise (shaped by casing)
+        white_noise = np.random.randn(num_samples).astype(np.float32)
+        if self.casing_filter and self.casing_filter.filters:
+            airflow_noise = self.casing_filter.process(white_noise)
+        else: # Fallback for fans without a specific casing model
+            b = [0.0499, -0.0959, 0.0506, -0.0044]
+            a = [1, -2.4949, 2.0172, -0.5221]
+            airflow_noise, self._noise_z_fallback = lfilter(b, a, white_noise, zi=self._noise_z_fallback)
+
+        # 2. Blade Hum (Blade Pass Frequency and its harmonics)
+        # BPF = (RPM / 60) * Number of Blades
+        blade_freq_profile = (rpm_profile / 60.0) * self.num_blades
+        
+        if self.pitch_variation > 0:
+            pitch_mod = 1.0 + self.pitch_variation * np.random.randn(num_samples) * speed_profile
+            blade_freq_profile *= pitch_mod
+
         phase_increments = 2 * np.pi * blade_freq_profile / self.sample_rate
         phase = self.phase_accumulator + np.cumsum(phase_increments)
-        fan_hum = 0.2 * np.sin(phase)
         self.phase_accumulator = phase[-1] % (2 * np.pi)
-        # --- END MODIFICATION ---
-        
-        final_noise = (brown_noise * 0.8 + fan_hum) * volume_profile
+
+        # Generate harmonics - higher harmonics get stronger with speed
+        harmonics_gain = 0.4 + speed_profile * 0.6
+        fan_hum = np.sin(phase) * 0.6
+        fan_hum += np.sin(phase * 2) * 0.25 * harmonics_gain
+        fan_hum += np.sin(phase * 3) * 0.15 * harmonics_gain**2
+        fan_hum /= 1.0 # Normalize
+
+        # 3. Combine noise and hum
+        final_noise = (airflow_noise * (1.0 - self.hum_to_noise_ratio) + fan_hum * self.hum_to_noise_ratio) * volume_profile
         return final_noise.astype(np.float32)
 
 # --- HIGH-FIDELITY SOUND GENERATION ---
@@ -178,10 +227,21 @@ def gcode_to_audio(gcode_file, output_file, sample_rate=44100):
     resonance_model = ResonanceFilter(sample_rate)
     motor_vol, extruder_vol, master_gain = 0.75, 0.55, 0.5
 
-    psu_fan = Fan(sample_rate, ramp_time=3.0, base_blade_freq=70, vol=0.15, base_pitch=0.8)
-    mainboard_fan = Fan(sample_rate, ramp_time=3.0, base_blade_freq=90, vol=0.12, base_pitch=1.0)
-    hotend_fan = Fan(sample_rate, ramp_time=2.0, base_blade_freq=110, vol=0.20, base_pitch=1.2)
-    part_cooling_fan = Fan(sample_rate, ramp_time=1.5, base_blade_freq=100, vol=0.25, base_pitch=1.1)
+    # --- Define Fan Characteristics ---
+    # Parameters: (frequency, Q-factor, gain)
+    psu_fan_casing = [(120, 10, 0.4), (240, 15, 0.3), (800, 20, 0.1)] # Larger fan, lower tones
+    mainboard_fan_casing = [(400, 25, 0.5), (800, 30, 0.3), (1200, 20, 0.2)] # Small fan, high pitched
+    hotend_fan_casing = [(250, 20, 0.6), (500, 25, 0.4), (1500, 20, 0.2)] # Mid-size axial fan
+    # Blower fans have a wider noise spectrum and less distinct hum
+    part_cooling_fan_casing = [(300, 5, 0.5), (1000, 8, 0.3), (2500, 10, 0.2)]
+
+    # --- Instantiate Fans with new Mathematical Model ---
+    # Staggered start times are handled by the main event loop
+    psu_fan = Fan(sample_rate, ramp_time=3.0, num_blades=7, max_rpm=2000, vol=0.15, pitch_variation=0.02, casing_filter_params=psu_fan_casing, hum_to_noise_ratio=0.2)
+    mainboard_fan = Fan(sample_rate, ramp_time=1.5, num_blades=9, max_rpm=5000, vol=0.12, pitch_variation=0.04, casing_filter_params=mainboard_fan_casing, hum_to_noise_ratio=0.2)
+    hotend_fan = Fan(sample_rate, ramp_time=2.0, num_blades=7, max_rpm=4000, vol=0.20, pitch_variation=0.03, casing_filter_params=hotend_fan_casing, hum_to_noise_ratio=0.2)
+    # Part cooling is a blower-style fan, so less hum and more airflow noise. Volume increased as requested.
+    part_cooling_fan = Fan(sample_rate, ramp_time=1.0, num_blades=11, max_rpm=6000, vol=1.0, pitch_variation=0.05, casing_filter_params=part_cooling_fan_casing, hum_to_noise_ratio=0.15)
     psu_fan.set_speed(1.0)
     mainboard_fan.set_speed(1.0)
     hotend_fan_start_time = first_heat_time if first_heat_time >= 0 else total_duration
