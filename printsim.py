@@ -91,8 +91,8 @@ def generate_extruder_waveform(phase):
 
 # --- MAIN ENGINE ---
 
-def gcode_to_audio(gcode_file, output_file):
-    print(f"Step 1: Planning motion with pyGCodeDecode...")
+def gcode_to_audio(gcode_file, output_file, printer_name=PRINTER_NAME):
+    print(f"Step 1: Planning motion with pyGCodeDecode using printer: {printer_name}...")
     
     clean_gcode_path = gcode_file + ".tmp"
     fan_events = []
@@ -106,6 +106,8 @@ def gcode_to_audio(gcode_file, output_file):
             if l.startswith('G28'):
                 f.write("G92 X110 Y110 Z125 E0\n")
                 f.write("G1 X0 Y0 Z0 F3000\n")
+            elif l.startswith('G4'):
+                continue
             elif l.startswith('M106'):
                 s = 255
                 for p in l.split():
@@ -115,11 +117,24 @@ def gcode_to_audio(gcode_file, output_file):
             elif l.startswith('M107'):
                 fan_events.append({'line': i+1, 'speed': 0.0})
                 f.write(line)
+            elif l.startswith('G0') or l.startswith('G1'):
+                # Filter out moves that are ONLY extruder (retractions/primes)
+                # These cause silent gaps in the audio.
+                parts = l.split()
+                has_xyz = any(p[0] in 'XYZ' for p in parts)
+                has_e = any(p.startswith('E') for p in parts)
+                if has_e and not has_xyz:
+                    # Preserve feedrate if it was set in this line
+                    f_part = next((p for p in parts if p.startswith('F')), None)
+                    if f_part:
+                        f.write(f"{parts[0]} {f_part}\n")
+                    continue
+                f.write(line)
             else:
                 f.write(line)
 
     try:
-        setup = gcode_interpreter.setup(presets_file=PRESETS_FILE, printer=PRINTER_NAME)
+        setup = gcode_interpreter.setup(presets_file=PRESETS_FILE, printer=printer_name)
         sim = gcode_interpreter.simulation(gcode_path=clean_gcode_path, initial_machine_setup=setup)
     finally:
         if os.path.exists(clean_gcode_path): os.remove(clean_gcode_path)
@@ -136,7 +151,7 @@ def gcode_to_audio(gcode_file, output_file):
     hotend_fan.set_speed(1.0)
 
     resonance_model = ResonanceFilter(SAMPLE_RATE)
-    motor_vol, extruder_vol = 0.55, 0.55
+    motor_vol, extruder_vol = 0.55, 0.45
     last_phases = {'X': 0.0, 'Y': 0.0, 'Z': 0.0, 'E': 0.0}
     fan_idx = 0
 
@@ -196,7 +211,13 @@ def gcode_to_audio(gcode_file, output_file):
     print(f"Done: {output_file}")
 
 if __name__ == "__main__":
+
     parser = argparse.ArgumentParser(description="Convert G-code to printer sound (Motion Test).")
+
     parser.add_argument("gcode", help="Input G-code file")
+
+    parser.add_argument("--printer", default=PRINTER_NAME, help=f"Printer preset from {PRESETS_FILE} (default: {PRINTER_NAME})")
+
     args = parser.parse_args()
-    gcode_to_audio(args.gcode, str(Path(args.gcode).with_suffix(".wav")))
+
+    gcode_to_audio(args.gcode, str(Path(args.gcode).with_suffix(".wav")), printer_name=args.printer)
