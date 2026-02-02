@@ -1,0 +1,17 @@
+# Default printer presets for printsim
+default_printer:
+  nozzle_diam: 0.4
+  filament_diam: 1.75
+  p_vel: 60
+  p_acc: 1500
+  jerk: 10
+  vX: 300
+  vY: 300
+  vZ: 40
+  vE: 60
+  firmware: marlin
+  X: 110
+  Y: 110
+  Z: 125
+  E: 0
+  printer: default_printer
