@@ -5,9 +5,10 @@ import numpy as np
 import io
 import os
 from tqdm import tqdm
-from scipy.signal import butter, lfilter
-from pyGCodeDecode import gcode_interpreter
+from scipy.signal import butter, lfilter, resample_poly
 from pathlib import Path
+import yaml
+from klipper_planner import KlipperPlanner
 
 # --- CONSTANTS & CONFIG ---
 SAMPLE_RATE = 44100
@@ -91,56 +92,48 @@ def generate_extruder_waveform(phase):
 
 # --- MAIN ENGINE ---
 
-def gcode_to_audio(gcode_file, output_file, printer_name=PRINTER_NAME):
-    print(f"Step 1: Planning motion with pyGCodeDecode using printer: {printer_name}...")
+def gcode_to_audio(gcode_file, output_file, printer_name=PRINTER_NAME, force_corexy=False):
+    print(f"Step 1: Planning motion with KlipperPlanner using printer: {printer_name}...")
     
+    # Load printer preset
+    with open(PRESETS_FILE, 'r') as f:
+        presets = yaml.safe_load(f)
+    preset = presets.get(printer_name, presets['default_printer'])
+    
+    planner = KlipperPlanner(
+        max_velocity=preset.get('vX', 300), 
+        max_accel=preset.get('p_acc', 1500),
+        scv=preset.get('jerk', 10) # Approx jerk as SCV
+    )
+    
+    # Pre-parse only to replace G28 (homing) with explicit position commands
     clean_gcode_path = gcode_file + ".tmp"
-    fan_events = []
-    
+
     with open(gcode_file, 'r') as f:
         lines = f.readlines()
-        
+
     with open(clean_gcode_path, 'w') as f:
-        for i, line in enumerate(lines):
-            l = line.strip().upper()
-            if l.startswith('G28'):
-                f.write("G92 X110 Y110 Z125 E0\n")
-                f.write("G1 X0 Y0 Z0 F3000\n")
-            elif l.startswith('G4'):
+        for line in lines:
+            stripped = line.split(';')[0].strip()
+            if not stripped:
                 continue
-            elif l.startswith('M106'):
-                s = 255
-                for p in l.split():
-                    if p.startswith('S'): s = float(p[1:])
-                fan_events.append({'line': i+1, 'speed': s / 255.0})
-                f.write(line)
-            elif l.startswith('M107'):
-                fan_events.append({'line': i+1, 'speed': 0.0})
-                f.write(line)
-            elif l.startswith('G0') or l.startswith('G1'):
-                # Filter out moves that are ONLY extruder (retractions/primes)
-                # These cause silent gaps in the audio.
-                parts = l.split()
-                has_xyz = any(p[0] in 'XYZ' for p in parts)
-                has_e = any(p.startswith('E') for p in parts)
-                if has_e and not has_xyz:
-                    # Preserve feedrate if it was set in this line
-                    f_part = next((p for p in parts if p.startswith('F')), None)
-                    if f_part:
-                        f.write(f"{parts[0]} {f_part}\n")
-                    continue
-                f.write(line)
+            if stripped.upper().startswith('G28'):
+                f.write(f"G92 X{preset.get('X',110)} Y{preset.get('Y',110)} Z{preset.get('Z',125)} E0\n")
+                f.write(f"G1 X0 Y0 Z0 F3000\n")
             else:
-                f.write(line)
+                f.write(stripped + '\n')
 
-    try:
-        setup = gcode_interpreter.setup(presets_file=PRESETS_FILE, printer=printer_name)
-        sim = gcode_interpreter.simulation(gcode_path=clean_gcode_path, initial_machine_setup=setup)
-    finally:
-        if os.path.exists(clean_gcode_path): os.remove(clean_gcode_path)
+    moves, fan_events = planner.parse_gcode(clean_gcode_path)
+    if os.path.exists(clean_gcode_path): os.remove(clean_gcode_path)
 
-    total_duration = sim.blocklist[-1].get_segments()[-1].t_end
-    total_samples = int(total_duration * SAMPLE_RATE)
+    if not moves:
+        print("No moves found in G-code.")
+        return
+
+    total_duration = sum(m.accel_t + m.cruise_t + m.decel_t
+                         for m in moves if m.is_kinematic_move)
+    
+    total_samples = int(total_duration * SAMPLE_RATE) + 100 # bit of buffer
     final_audio = np.zeros((total_samples, 2), dtype=np.float32)
     
     # Setup Fans
@@ -151,55 +144,156 @@ def gcode_to_audio(gcode_file, output_file, printer_name=PRINTER_NAME):
     hotend_fan.set_speed(1.0)
 
     resonance_model = ResonanceFilter(SAMPLE_RATE)
+    kinematics = 'corexy' if force_corexy else preset.get('kinematics', 'cartesian')
     motor_vol, extruder_vol = 0.55, 0.45
-    last_phases = {'X': 0.0, 'Y': 0.0, 'Z': 0.0, 'E': 0.0}
-    fan_idx = 0
+    last_phases = {'X': 0.0, 'Y': 0.0, 'Z': 0.0, 'E': 0.0,
+                   'A': 0.0, 'B': 0.0, 'TA': 0.0, 'TB': 0.0, 'TC': 0.0}
+    fan_event_idx = 0
 
+    # Precompute delta tower geometry
+    if kinematics == 'delta':
+        _r   = preset.get('tower_radius', 100.0)
+        _arm2 = preset.get('arm_length', 220.0) ** 2
+        delta_towers = [
+            ('TA', _r * math.cos(math.radians(210)), _r * math.sin(math.radians(210))),
+            ('TB', _r * math.cos(math.radians(330)), _r * math.sin(math.radians(330))),
+            ('TC', _r * math.cos(math.radians(90)),  _r * math.sin(math.radians(90))),
+        ]
+    else:
+        delta_towers = None
+        _arm2 = None
+    
+    curr_t = 0.0
+    curr_sample = 0
     print("Step 2: Synthesizing audio...")
-    for block in tqdm(sim.blocklist, desc="Processing Blocks"):
-        line_num = block.state_B.line_number
-        while fan_idx < len(fan_events) and fan_events[fan_idx]['line'] <= line_num:
-            part_cooling_fan.set_speed(fan_events[fan_idx]['speed'])
-            fan_idx += 1
+    for m in tqdm(moves, desc="Processing Moves"):
+        move_duration = m.accel_t + m.cruise_t + m.decel_t
 
-        for seg in block.get_segments():
-            t_start, t_end = float(seg.t_begin), float(seg.t_end)
-            s_start, s_end = int(t_start * SAMPLE_RATE), int(t_end * SAMPLE_RATE)
-            num_samples = s_end - s_start
-            if num_samples <= 0: continue
+        while fan_event_idx < len(fan_events) and fan_events[fan_event_idx]['time'] <= curr_t + move_duration:
+            part_cooling_fan.set_speed(fan_events[fan_event_idx]['speed'])
+            fan_event_idx += 1
 
-            v_begin = seg.vel_begin.get_vec(withExtrusion=True)
-            v_end = seg.vel_end.get_vec(withExtrusion=True)
-            pan = np.clip(seg.get_position(t_start).x / 220.0, 0.1, 0.9)
+        if not m.is_kinematic_move:
+            continue
 
+        phases_data = [
+            (m.accel_t, m.start_v, m.cruise_v),
+            (m.cruise_t, m.cruise_v, m.cruise_v),
+            (m.decel_t, m.cruise_v, m.end_v)
+        ]
+
+        move_start_pos = np.array(m.start_pos)
+        axes_r = np.array(m.axes_r)
+        dist_traveled = 0.0
+
+        if kinematics == 'corexy':
+            motor_ratios = [
+                ('A', abs(float(axes_r[0]) + float(axes_r[1]))),
+                ('B', abs(float(axes_r[0]) - float(axes_r[1]))),
+                ('Z', abs(float(axes_r[2]))),
+                ('E', abs(float(axes_r[3]))),
+            ]
+        elif kinematics == 'delta':
+            motor_ratios = None  # towers handled separately (position-dependent)
+        else:
+            motor_ratios = [
+                ('X', abs(float(axes_r[0]))),
+                ('Y', abs(float(axes_r[1]))),
+                ('Z', abs(float(axes_r[2]))),
+                ('E', abs(float(axes_r[3]))),
+            ]
+
+        for duration, v0, v1 in phases_data:
+            if duration <= 1e-6: continue
+
+            num_samples = int(duration * SAMPLE_RATE)
+            if num_samples <= 0:
+                curr_t += duration
+                continue
+
+            s_start = curr_sample
+            s_end = s_start + num_samples
+            
+            if s_end > final_audio.shape[0]:
+                s_end = final_audio.shape[0]
+                num_samples = s_end - s_start
+                if num_samples <= 0: break
+
+            t_profile = np.linspace(0, duration, num_samples)
+            v_profile = v0 + (v1 - v0) * (t_profile / duration)
+            
+            # Cumulative distance in this phase
+            d_in_phase = np.cumsum(v_profile / SAMPLE_RATE)
+            
+            # Current X position for panning
+            phase_start_dist = dist_traveled
+            x_positions = move_start_pos[0] + axes_r[0] * (phase_start_dist + d_in_phase)
+            pan = np.clip(x_positions / 220.0, 0.1, 0.9)
+            
             seg_mono = np.zeros(num_samples, dtype=np.float32)
             fans_audio = psu_fan.generate_audio(num_samples) + \
                          hotend_fan.generate_audio(num_samples) + \
                          part_cooling_fan.generate_audio(num_samples)
 
-            for axis_idx, axis_key in enumerate(['X', 'Y', 'Z', 'E']):
-                v0, v1 = v_begin[axis_idx], v_end[axis_idx]
-                if v0 == 0 and v1 == 0: continue
-                
-                v_profile = np.abs(np.linspace(v0, v1, num_samples))
-                base_freq = {'X': 70, 'Y': 75, 'Z': 35, 'E': 150}[axis_key]
-                freq_profile = base_freq + v_profile * 10
-                phases = last_phases[axis_key] + np.cumsum(2 * np.pi * freq_profile / SAMPLE_RATE)
-                last_phases[axis_key] = phases[-1] % (2 * np.pi)
-                
-                if axis_key == 'E':
-                    wav = generate_extruder_waveform(phases) * extruder_vol
-                else:
-                    wav = generate_stepper_waveform(phases) * motor_vol
-                
-                if axis_key == 'X':
-                    final_audio[s_start:s_end, 0] += wav * (1 - pan)
-                    final_audio[s_start:s_end, 1] += wav * pan
-                else:
-                    seg_mono += wav
+            OS = 4
+            OS_SR = SAMPLE_RATE * OS
+            base_freqs = {'X': 70, 'Y': 75, 'Z': 35, 'A': 70, 'B': 75, 'E': 150}
+            v_profile_os = np.linspace(v0, v1, num_samples * OS, dtype=np.float32)
+
+            if kinematics == 'delta':
+                # Tower velocities are position-dependent — compute at normal rate
+                # then interpolate up before synthesis
+                x_pos = move_start_pos[0] + axes_r[0] * (dist_traveled + d_in_phase)
+                y_pos = move_start_pos[1] + axes_r[1] * (dist_traveled + d_in_phase)
+                vx = v_profile * float(axes_r[0])
+                vy = v_profile * float(axes_r[1])
+                vz = v_profile * float(axes_r[2])
+                t_os = np.arange(num_samples * OS) * (1.0 / OS)
+                t_normal = np.arange(num_samples, dtype=np.float64)
+                for tower_key, tx, ty in delta_towers:
+                    dx = x_pos - tx
+                    dy = y_pos - ty
+                    d_vert = np.sqrt(np.maximum(_arm2 - dx**2 - dy**2, 1.0))
+                    tower_v = np.abs((-dx * vx - dy * vy) / d_vert + vz)
+                    tower_v_os = np.interp(t_os, t_normal, tower_v).astype(np.float32)
+                    freq_os = 70.0 + tower_v_os * 10
+                    phases_os = last_phases[tower_key] + np.cumsum(2 * np.pi * freq_os / OS_SR)
+                    last_phases[tower_key] = float(phases_os[-1]) % (2 * np.pi)
+                    wav_os = generate_stepper_waveform(phases_os) * motor_vol
+                    seg_mono += resample_poly(wav_os, 1, OS).astype(np.float32)[:num_samples]
+                # Extruder (independent of tower geometry)
+                e_r = abs(float(axes_r[3]))
+                if e_r > 1e-6:
+                    e_v_os = v_profile_os * e_r
+                    freq_os = 150.0 + e_v_os * 10
+                    phases_os = last_phases['E'] + np.cumsum(2 * np.pi * freq_os / OS_SR)
+                    last_phases['E'] = float(phases_os[-1]) % (2 * np.pi)
+                    wav_os = generate_extruder_waveform(phases_os) * extruder_vol
+                    seg_mono += resample_poly(wav_os, 1, OS).astype(np.float32)[:num_samples]
+            else:
+                for motor_key, motor_r in motor_ratios:
+                    motor_v_os = v_profile_os * motor_r
+                    if np.max(motor_v_os) < 1e-6: continue
+                    freq_os = base_freqs[motor_key] + motor_v_os * 10
+                    phases_os = last_phases[motor_key] + np.cumsum(2 * np.pi * freq_os / OS_SR)
+                    last_phases[motor_key] = float(phases_os[-1]) % (2 * np.pi)
+                    if motor_key == 'E':
+                        wav_os = generate_extruder_waveform(phases_os) * extruder_vol
+                    else:
+                        wav_os = generate_stepper_waveform(phases_os) * motor_vol
+                    wav = resample_poly(wav_os, 1, OS).astype(np.float32)[:num_samples]
+                    if motor_key == 'X':
+                        final_audio[s_start:s_end, 0] += wav * (1 - pan)
+                        final_audio[s_start:s_end, 1] += wav * pan
+                    else:
+                        seg_mono += wav
             
             final_audio[s_start:s_end, 0] += seg_mono + fans_audio
             final_audio[s_start:s_end, 1] += seg_mono + fans_audio
+            
+            curr_t += duration
+            curr_sample += num_samples
+            dist_traveled += (v0 + v1) * 0.5 * duration
 
     print("Step 3: Post-processing...")
     final_audio[:, 0] += resonance_model.process(final_audio[:, 0])
@@ -215,9 +309,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Convert G-code to printer sound (Motion Test).")
 
     parser.add_argument("gcode", help="Input G-code file")
-
     parser.add_argument("--printer", default=PRINTER_NAME, help=f"Printer preset from {PRESETS_FILE} (default: {PRINTER_NAME})")
+    parser.add_argument("--corexy", action="store_true", help="Force CoreXY kinematics regardless of preset")
 
     args = parser.parse_args()
 
-    gcode_to_audio(args.gcode, str(Path(args.gcode).with_suffix(".wav")), printer_name=args.printer)
+    gcode_to_audio(args.gcode, str(Path(args.gcode).with_suffix(".wav")), printer_name=args.printer, force_corexy=args.corexy)
