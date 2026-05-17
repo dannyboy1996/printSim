@@ -9,9 +9,63 @@ default_printer:
   vY: 300
   vZ: 40
   vE: 60
-  firmware: marlin
+  kinematics: cartesian
+  firmware: klipper
   X: 110
   Y: 110
   Z: 125
   E: 0
   printer: default_printer
+  # Full mechanical steps/mm (geometry only — no microstepping factor).
+  # step_freq_hz = velocity_mm_s × steps_per_mm_x  (before microstepping).
+  # Ender-3 style: 200-step motor, 20T GT2 pulley → 200/(20×2) = 5 steps/mm.
+  steps_per_mm_x: 5.0
+  steps_per_mm_y: 5.0
+  steps_per_mm_z: 25.0   # T8 leadscrew 8 mm/rev → 200/8 = 25
+  steps_per_mm_e: 5.8    # MK8 hob ~10.87 mm dia → 200/(π×10.87) ≈ 5.86
+
+anycubic_kossel:
+  nozzle_diam: 0.4
+  filament_diam: 1.75
+  p_vel: 60
+  p_acc: 3000
+  jerk: 5
+  vX: 300
+  vY: 300
+  vZ: 300
+  vE: 50
+  kinematics: delta
+  tower_radius: 102.5
+  arm_length: 227.0
+  firmware: klipper
+  X: 0
+  Y: 0
+  Z: 50
+  E: 0
+  printer: anycubic_kossel
+  steps_per_mm_x: 5.0    # tower motors: same GT2 belt geometry as Ender X/Y
+  steps_per_mm_y: 5.0
+  steps_per_mm_z: 5.0
+  steps_per_mm_e: 5.8
+
+voron_2.4_300:
+  nozzle_diam: 0.4
+  filament_diam: 1.75
+  p_vel: 150
+  p_acc: 5000
+  jerk: 5
+  vX: 500
+  vY: 500
+  vZ: 30
+  vE: 50
+  kinematics: corexy
+  firmware: klipper
+  X: 150
+  Y: 300
+  Z: 50
+  E: 0
+  printer: voron_2.4_300
+  steps_per_mm_x: 6.25   # 200-step motor, 16T GT2 pulley → 200/(16×2) = 6.25
+  steps_per_mm_y: 6.25
+  steps_per_mm_z: 12.5   # 2:1 belt + T8 8mm/rev → 200/(8×0.5) = 50? varies
+  steps_per_mm_e: 7.17   # Clockwork2/LGX: ~7 full steps/mm (motor geared)
