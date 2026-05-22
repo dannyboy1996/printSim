@@ -17,27 +17,6 @@ PRINTER_NAME = "default_printer"
 
 # --- REINSTATED SOUND ENGINE COMPONENTS ---
 
-class ResonanceFilter:
-    """A bank of resonant filters to simulate the printer's frame ringing."""
-    def __init__(self, sample_rate=44100):
-        params = [(85, 30, 0.6), (120, 40, 0.4), (250, 20, 0.2)]
-        self.filters = [self._create_filter(freq, Q, gain, sample_rate) for freq, Q, gain in params]
-
-    def _create_filter(self, freq, Q, gain, fs):
-        nyquist = 0.5 * fs
-        low = max(1, freq - freq / (2 * Q))
-        high = min(nyquist - 1, freq + freq / (2 * Q))
-        if low >= high: high = low + 1
-        b, a = butter(2, [low, high], btype='band', fs=fs)
-        return {'b': b, 'a': a, 'gain': gain, 'z': np.zeros(max(len(a), len(b)) - 1)}
-
-    def process(self, signal):
-        output = np.zeros_like(signal)
-        for f in self.filters:
-            y, f['z'] = lfilter(f['b'], f['a'], signal, zi=f['z'])
-            output += y * f['gain']
-        return output
-
 class Fan:
     """Simulates a fan based on mathematical principles."""
     def __init__(self, sample_rate, ramp_time=1.5, num_blades=7, max_rpm=4000, vol=1.0, hum_to_noise_ratio=0.3):
@@ -143,7 +122,6 @@ def gcode_to_audio(gcode_file, output_file, printer_name=PRINTER_NAME, force_cor
     psu_fan.set_speed(1.0)
     hotend_fan.set_speed(1.0)
 
-    resonance_model = ResonanceFilter(SAMPLE_RATE)
     kinematics = 'corexy' if force_corexy else preset.get('kinematics', 'cartesian')
     motor_vol, extruder_vol = 0.55, 0.45
     last_phases = {'X': 0.0, 'Y': 0.0, 'Z': 0.0, 'E': 0.0,
@@ -296,8 +274,6 @@ def gcode_to_audio(gcode_file, output_file, printer_name=PRINTER_NAME, force_cor
             dist_traveled += (v0 + v1) * 0.5 * duration
 
     print("Step 3: Post-processing...")
-    final_audio[:, 0] += resonance_model.process(final_audio[:, 0])
-    final_audio[:, 1] += resonance_model.process(final_audio[:, 1])
 
     max_val = np.max(np.abs(final_audio))
     if max_val > 0: final_audio /= max_val
