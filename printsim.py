@@ -4,11 +4,11 @@ import soundfile as sf
 import numpy as np
 import os
 from tqdm import tqdm
-from scipy.signal import butter
+from scipy.signal import butter, firwin
 from pathlib import Path
 import yaml
 from klipper_planner import KlipperPlanner
-import sound_kernels as sk
+from numba import njit, prange
 
 # --- CONSTANTS & CONFIG ---
 SAMPLE_RATE = 44100
@@ -18,7 +18,6 @@ PRINTER_NAME = "default_printer"
 # Frame ringing: (centre frequency, Q, gain)
 RESONANCE_MODES = [(85, 30, 0.6), (120, 40, 0.4), (250, 20, 0.2)]
 
-<<<<<<< HEAD
 # Airflow noise shaping filter (pink-ish), shared by every fan.
 FAN_NOISE_B = np.array([0.0499, -0.0959, 0.0506, -0.0044])
 FAN_NOISE_A = np.array([1.0, -2.4949, 2.0172, -0.5221])
@@ -29,19 +28,398 @@ BASE_FREQS = {'X': 70.0, 'Y': 75.0, 'Z': 35.0, 'A': 70.0, 'B': 75.0, 'E': 150.0}
 PAN_WIDTH_MM = 220.0
 
 
+# --- JIT SYNTHESIS KERNELS ---
+#
+# Everything below is compiled by numba the first time it runs (and cached on
+# disk afterwards, so only the very first run pays for it). The kernels do the
+# per-sample work the engine used to do with per-segment NumPy/scipy calls:
+# a print is thousands of short segments, and the fixed cost of those calls
+# dominated the actual arithmetic.
+
+TWO_PI = 2.0 * math.pi
+OS = 4              # motor synthesis oversampling factor
+LUT_SIZE = 8192     # waveform table resolution (+1 guard point for interp)
+CHUNK = 4096        # output samples rendered per inner block
+
+
+def _make_lut(fn):
+    """One period of a waveform, sampled for table lookup."""
+    return fn(np.linspace(0.0, TWO_PI, LUT_SIZE + 1))
+
+
+SIN_LUT = _make_lut(np.sin)
+STEPPER_LUT = _make_lut(
+    lambda p: (np.sin(p) + 0.2 * np.sin(p * 2)) / 1.2 + 0.5 * np.sin(p * 8))
+EXTRUDER_LUT = _make_lut(
+    lambda p: (np.sin(p) + 0.5 * np.sin(p * 3) + 0.2 * np.sin(p * 5)) / 1.7)
+
+# Anti-alias filter for the OS -> 1 decimation. Same design that
+# resample_poly(x, 1, OS) uses internally, so the decimated signal matches the
+# pre-JIT engine; the difference is that here it runs as one continuous stream
+# per voice instead of being restarted (and zero-padded) on every segment.
+DECIM_FIR = firwin(2 * 10 * OS + 1, 1.0 / OS, window=('kaiser', 5.0))
+NHIST = DECIM_FIR.size - 1   # oversampled input history carried per voice
+FAN_STATE_SIZE = 8           # see synth_fans_block for the layout
+
+
+@njit(cache=True, fastmath=True, inline='always')
+def _lut_at(lut, phase):
+    """Linearly interpolated table lookup; ``phase`` is radians in [0, 2pi)."""
+    x = phase * (LUT_SIZE / TWO_PI)
+    i = int(x)
+    if i < 0:
+        i = 0
+    elif i >= LUT_SIZE:
+        i = LUT_SIZE - 1
+    f = x - i
+    return lut[i] + f * (lut[i + 1] - lut[i])
+
+
+@njit(cache=True, fastmath=True, inline='always')
+def _wrap(ph):
+    """Fold a phase back into [0, 2pi).
+
+    A full fold, not a single subtraction: a delta tower whose effector sits
+    outside the arm reach can ask for a frequency above the oversampled rate,
+    and a phase step bigger than 2pi would otherwise run away and walk the
+    table lookup off the end of the array.
+    """
+    if ph >= TWO_PI:
+        ph -= TWO_PI * math.floor(ph * (1.0 / TWO_PI))
+    return ph
+
+
+@njit(cache=True, fastmath=True, inline='always')
+def _dist_at(m, v0, dv, sample_rate):
+    """Distance covered through sample ``m`` of a linear velocity ramp.
+
+    Closed form of cumsum(v / sample_rate) for v[k] = v0 + dv * k.
+    """
+    return ((m + 1.0) * v0 + dv * m * (m + 1.0) * 0.5) / sample_rate
+
+
+@njit(cache=True, fastmath=True)
+def _decimate(buf, nout, fir, dst, dst_off):
+    """Filter ``buf`` (NHIST history + nout*OS new samples) down by OS.
+
+    The FIR is linear phase, so taps are applied in ascending order over
+    contiguous memory. Output lags the input by half the filter (10 samples,
+    0.2 ms), the same for every voice, so the mix stays aligned.
+    """
+    ntap = fir.size
+    for m in range(nout):
+        base = NHIST + m * OS + OS - ntap
+        acc = 0.0
+        for k in range(ntap):
+            acc += fir[k] * buf[base + k]
+        dst[dst_off + m] = np.float32(acc)
+
+
+@njit(cache=True, fastmath=True)
+def _silence(buf, hist, v, n, fir, dst, off):
+    """Fill a segment where this voice is not moving.
+
+    The filter still has to ring out from whatever came before; once its
+    history is empty the rest of the segment is just zeros.
+    """
+    ringing = False
+    for k in range(NHIST):
+        if hist[v, k] != 0.0:
+            ringing = True
+            break
+    m0 = 0
+    if ringing:
+        m0 = NHIST // OS + 1
+        if m0 > n:
+            m0 = n
+        for k in range(NHIST):
+            buf[k] = hist[v, k]
+        for j in range(m0 * OS):
+            buf[NHIST + j] = 0.0
+        _decimate(buf, m0, fir, dst, off)
+        for k in range(NHIST):
+            hist[v, k] = buf[m0 * OS + k]
+    for m in range(m0, n):
+        dst[off + m] = np.float32(0.0)
+
+
+@njit(cache=True, parallel=True, fastmath=True)
+def synth_motors(ns, off, v0, v1, ratio, base_freq, is_extruder,
+                 phase, hist, fir, stepper_lut, extruder_lut,
+                 motor_vol, extruder_vol, sample_rate, vbuf):
+    """Render one batch of segments for every motor voice.
+
+    Voices are independent (own phase, own filter history), so they run in
+    parallel; segments within a voice stay in order because the phase carries.
+    """
+    n_seg = ns.size
+    n_voice = base_freq.size
+    os_sr = sample_rate * OS
+    for v in prange(n_voice):
+        lut = extruder_lut if is_extruder[v] else stepper_lut
+        vol = extruder_vol if is_extruder[v] else motor_vol
+        bf = base_freq[v]
+        buf = np.empty(NHIST + CHUNK * OS)
+        ph = phase[v]
+        dst = vbuf[v]
+        for s in range(n_seg):
+            n = ns[s]
+            o = off[s]
+            r = ratio[s, v]
+            a0 = v0[s] * r
+            a1 = v1[s] * r
+            if max(abs(a0), abs(a1)) < 1e-6:
+                _silence(buf, hist, v, n, fir, dst, o)
+                continue
+
+            nos = n * OS
+            dv = (a1 - a0) / (nos - 1) if nos > 1 else 0.0
+            m0 = 0
+            while m0 < n:
+                c = min(CHUNK, n - m0)
+                for k in range(NHIST):
+                    buf[k] = hist[v, k]
+                for j in range(c * OS):
+                    vel = a0 + dv * (m0 * OS + j)
+                    ph = _wrap(ph + TWO_PI * (bf + vel * 10.0) / os_sr)
+                    buf[NHIST + j] = _lut_at(lut, ph) * vol
+                _decimate(buf, c, fir, dst, o + m0)
+                for k in range(NHIST):
+                    hist[v, k] = buf[c * OS + k]
+                m0 += c
+        phase[v] = ph
+
+
+@njit(cache=True, fastmath=True)
+def _tower_v(m, v0, dv, d0, x0, y0, arx, ary, arz, tx, ty, arm2, sample_rate):
+    """Carriage speed of one delta tower at output sample ``m``.
+
+    Differentiating the delta kinematics: tower height is
+    sqrt(arm^2 - dx^2 - dy^2) + z, so its rate depends on where the effector
+    currently is, not just on how fast it is moving.
+    """
+    d = d0 + _dist_at(m, v0, dv, sample_rate)
+    dx = x0 + arx * d - tx
+    dy = y0 + ary * d - ty
+    vert = arm2 - dx * dx - dy * dy
+    if vert < 1.0:
+        vert = 1.0
+    vert = math.sqrt(vert)
+    vm = v0 + dv * m
+    return abs((-dx * (vm * arx) - dy * (vm * ary)) / vert + vm * arz)
+
+
+@njit(cache=True, parallel=True, fastmath=True)
+def synth_delta(ns, off, v0, v1, x0, y0, arx, ary, arz, are, d0,
+                tower_x, tower_y, arm2, phase, hist, fir,
+                stepper_lut, extruder_lut, motor_vol, extruder_vol,
+                sample_rate, vbuf):
+    """Delta form of synth_motors: voices 0-2 are towers, voice 3 the extruder."""
+    n_seg = ns.size
+    os_sr = sample_rate * OS
+    for v in prange(4):
+        buf = np.empty(NHIST + CHUNK * OS)
+        ph = phase[v]
+        dst = vbuf[v]
+        is_tower = v < 3
+        tx = tower_x[v] if is_tower else 0.0
+        ty = tower_y[v] if is_tower else 0.0
+        lut = stepper_lut if is_tower else extruder_lut
+        vol = motor_vol if is_tower else extruder_vol
+        bf = 70.0 if is_tower else 150.0
+
+        for s in range(n_seg):
+            n = ns[s]
+            o = off[s]
+            a0 = v0[s]
+            a1 = v1[s]
+            r = 1.0 if is_tower else are[s]
+            if r < 1e-6 or (is_tower and max(abs(a0), abs(a1)) < 1e-6):
+                _silence(buf, hist, v, n, fir, dst, o)
+                continue
+
+            # tower speed is evaluated at output rate and interpolated up;
+            # the extruder just rides the velocity ramp
+            dv_out = (a1 - a0) / (n - 1) if n > 1 else 0.0
+            nos = n * OS
+            dv_os = (a1 * r - a0 * r) / (nos - 1) if nos > 1 else 0.0
+
+            m0 = 0
+            while m0 < n:
+                c = min(CHUNK, n - m0)
+                for k in range(NHIST):
+                    buf[k] = hist[v, k]
+                if is_tower:
+                    tv0 = _tower_v(m0, a0, dv_out, d0[s], x0[s], y0[s],
+                                   arx[s], ary[s], arz[s], tx, ty, arm2,
+                                   sample_rate)
+                    for m in range(c):
+                        nxt = m0 + m + 1
+                        if nxt > n - 1:
+                            nxt = n - 1
+                        tv1 = _tower_v(nxt, a0, dv_out, d0[s], x0[s], y0[s],
+                                       arx[s], ary[s], arz[s], tx, ty, arm2,
+                                       sample_rate)
+                        for j in range(OS):
+                            tv = tv0 + (tv1 - tv0) * (j / OS)
+                            ph = _wrap(ph + TWO_PI * (bf + tv * 10.0) / os_sr)
+                            buf[NHIST + m * OS + j] = _lut_at(lut, ph) * vol
+                        tv0 = tv1
+                else:
+                    for j in range(c * OS):
+                        vel = a0 * r + dv_os * (m0 * OS + j)
+                        ph = _wrap(ph + TWO_PI * (bf + vel * 10.0) / os_sr)
+                        buf[NHIST + j] = _lut_at(lut, ph) * vol
+                _decimate(buf, c, fir, dst, o + m0)
+                for k in range(NHIST):
+                    hist[v, k] = buf[c * OS + k]
+                m0 += c
+        phase[v] = ph
+
+
+@njit(cache=True, parallel=True, fastmath=True)
+def mix_voices(vbuf, n_voice, ns, off, start, v0, v1, x0, arx, d0,
+               pan_voice, pan_width, sample_rate, out):
+    """Sum the voices into the stereo buffer, panning one voice by X position.
+
+    Segments own disjoint stretches of the output, so they mix in parallel.
+    """
+    for s in prange(ns.size):
+        n = ns[s]
+        o = off[s]
+        st = start[s]
+        a0 = v0[s]
+        dv = (v1[s] - a0) / (n - 1) if n > 1 else 0.0
+        for m in range(n):
+            mono = 0.0
+            for v in range(n_voice):
+                if v != pan_voice:
+                    mono += vbuf[v, o + m]
+            if pan_voice >= 0:
+                d = d0[s] + _dist_at(m, a0, dv, sample_rate)
+                pan = (x0[s] + arx[s] * d) / pan_width
+                if pan < 0.1:
+                    pan = 0.1
+                elif pan > 0.9:
+                    pan = 0.9
+                w = vbuf[pan_voice, o + m]
+                out[0, st + m] += np.float32(mono + w * (1.0 - pan))
+                out[1, st + m] += np.float32(mono + w * pan)
+            else:
+                out[0, st + m] += np.float32(mono)
+                out[1, st + m] += np.float32(mono)
+
+
+@njit(cache=True, parallel=True, fastmath=True)
+def synth_fans_block(params, ev_sample, ev_speed, starts, counts, nb, na,
+                     sin_lut, sample_rate, n, noise, global_start,
+                     states, scratch, out, out_off):
+    """Render one block of every fan and add it to both channels.
+
+    Per-fan state row: [started, speed, target, phase, z0, z1, z2, event idx].
+    Speed ramps one sample at a time towards the target, so a fan command lands
+    on its own sample instead of being quantized to the block.
+    """
+    n_fan = params.shape[0]
+    for f in prange(n_fan):
+        ramp_time = params[f, 1]
+        blades = params[f, 2]
+        max_rpm = params[f, 3]
+        vol = params[f, 4]
+        hnr = params[f, 5]
+        if states[f, 0] == 0.0:
+            states[f, 0] = 1.0
+            states[f, 2] = params[f, 0]   # initial speed is the first target
+        cur = states[f, 1]
+        tgt = states[f, 2]
+        ph = states[f, 3]
+        z0 = states[f, 4]
+        z1 = states[f, 5]
+        z2 = states[f, 6]
+        ei = int(states[f, 7])
+        e_lo = starts[f]
+        e_n = counts[f]
+        step = 1.0 / (ramp_time * sample_rate) if ramp_time > 0 else 2.0
+
+        for i in range(n):
+            g = global_start + i
+            while ei < e_n and ev_sample[e_lo + ei] <= g:
+                tgt = ev_speed[e_lo + ei]
+                ei += 1
+            d = tgt - cur
+            if d > step:
+                d = step
+            elif d < -step:
+                d = -step
+            cur += d
+
+            # airflow: white noise through the shared shaping filter
+            w = noise[f, i]
+            y = nb[0] * w + z0
+            z0 = nb[1] * w - na[1] * y + z1
+            z1 = nb[2] * w - na[2] * y + z2
+            z2 = nb[3] * w - na[3] * y
+
+            # blade passing tone plus its second harmonic
+            ph = _wrap(ph + TWO_PI * (max_rpm * cur / 60.0) * blades / sample_rate)
+            ph2 = _wrap(ph * 2.0)
+            hum = (_lut_at(sin_lut, ph) * 0.6
+                   + _lut_at(sin_lut, ph2) * 0.25 * (0.4 + cur * 0.6))
+
+            scratch[f, i] = (y * (1.0 - hnr) + hum * hnr) * cur * vol
+
+        states[f, 1] = cur
+        states[f, 2] = tgt
+        states[f, 3] = ph
+        states[f, 4] = z0
+        states[f, 5] = z1
+        states[f, 6] = z2
+        states[f, 7] = ei
+
+    for i in prange(n):
+        acc = 0.0
+        for f in range(n_fan):
+            acc += scratch[f, i]
+        out[0, out_off + i] += np.float32(acc)
+        out[1, out_off + i] += np.float32(acc)
+
+
+@njit(cache=True, parallel=True, fastmath=True)
+def apply_resonance(out, b, a, gains):
+    """Add the frame ringing: a bank of band-passes fed by the dry mix."""
+    n_mode = gains.size
+    n = out.shape[1]
+    for c in prange(out.shape[0]):
+        z = np.zeros((n_mode, 4))
+        for i in range(n):
+            x = np.float64(out[c, i])
+            acc = 0.0
+            for k in range(n_mode):
+                y = b[k, 0] * x + z[k, 0]
+                z[k, 0] = b[k, 1] * x - a[k, 1] * y + z[k, 1]
+                z[k, 1] = b[k, 2] * x - a[k, 2] * y + z[k, 2]
+                z[k, 2] = b[k, 3] * x - a[k, 3] * y + z[k, 3]
+                z[k, 3] = b[k, 4] * x - a[k, 4] * y
+                acc += y * gains[k]
+            out[c, i] = np.float32(x + acc)
+
+
+@njit(cache=True, parallel=True)
+def peak_abs(out):
+    """Largest absolute sample in the mix, for normalization."""
+    peak = 0.0
+    for i in prange(out.shape[1]):
+        for c in range(out.shape[0]):
+            peak = max(peak, abs(out[c, i]))
+    return peak
+
 class FanSpec:
-    """Parameters of one fan. The audio itself is rendered by sound_kernels."""
+    """Parameters of one fan. The audio itself is rendered by synth_fans_block."""
 
     def __init__(self, vol=1.0, max_rpm=4000, ramp_time=1.5, num_blades=7,
                  hum_to_noise_ratio=0.3, initial_speed=0.0, events=None):
         self.vol = vol
         self.max_rpm = max_rpm
-=======
-class Fan:
-    """Simulates a fan based on mathematical principles."""
-    def __init__(self, sample_rate, ramp_time=1.5, num_blades=7, max_rpm=4000, vol=1.0, hum_to_noise_ratio=0.3):
-        self.sample_rate = sample_rate
->>>>>>> 94a1576671dc886884280d66625d7dcc0ce2ab18
         self.ramp_time = ramp_time
         self.num_blades = num_blades
         self.hum_to_noise_ratio = hum_to_noise_ratio
@@ -70,7 +448,7 @@ def render_fans(fans, out, sample_rate=SAMPLE_RATE, block=1 << 20, rng=None):
     ev_speed = np.concatenate([f.ev_speed for f in fans]).astype(np.float64)
     counts = np.array([len(f.ev_sample) for f in fans], dtype=np.int64)
     starts = np.concatenate(([0], np.cumsum(counts)[:-1])).astype(np.int64)
-    states = np.zeros((n_fan, sk.FAN_STATE_SIZE))
+    states = np.zeros((n_fan, FAN_STATE_SIZE))
     noise = np.empty((n_fan, block))
     scratch = np.empty((n_fan, block))
 
@@ -80,8 +458,8 @@ def render_fans(fans, out, sample_rate=SAMPLE_RATE, block=1 << 20, rng=None):
         # always fill the whole buffer so the kernel keeps one array type;
         # the tail block just ignores the samples past m
         rng.standard_normal((n_fan, block), out=noise)
-        sk.synth_fans_block(params, ev_sample, ev_speed, starts, counts,
-                            FAN_NOISE_B, FAN_NOISE_A, sk.SIN_LUT,
+        synth_fans_block(params, ev_sample, ev_speed, starts, counts,
+                            FAN_NOISE_B, FAN_NOISE_A, SIN_LUT,
                             float(sample_rate), m, noise, i, states, scratch,
                             out, i)
 
@@ -257,7 +635,7 @@ def _render_motors(segs, kinematics, preset, out, motor_vol, extruder_vol,
         pan_voice = keys.index('X') if 'X' in keys else -1
 
     phase = np.zeros(n_voice)
-    hist = np.zeros((n_voice, sk.NHIST))
+    hist = np.zeros((n_voice, NHIST))
 
     bounds = _batch_bounds(segs['ns'], batch_samples)
     vbuf = np.empty((n_voice, max(b[2] for b in bounds)), dtype=np.float32)
@@ -268,23 +646,23 @@ def _render_motors(segs, kinematics, preset, out, motor_vol, extruder_vol,
         # offsets of each segment inside the scratch buffer
         off = np.concatenate(([0], np.cumsum(ns_all[sl])[:-1])).astype(np.int64)
         if kinematics == 'delta':
-            sk.synth_delta(ns_all[sl], off, segs['v0'][sl], segs['v1'][sl],
+            synth_delta(ns_all[sl], off, segs['v0'][sl], segs['v1'][sl],
                            segs['x0'][sl], segs['y0'][sl],
                            segs['arx'][sl], segs['ary'][sl],
                            segs['arz'][sl], segs['are'][sl], segs['d0'][sl],
                            tower_x, tower_y, arm2,
-                           phase, hist, sk.DECIM_FIR,
-                           sk.STEPPER_LUT, sk.EXTRUDER_LUT,
+                           phase, hist, DECIM_FIR,
+                           STEPPER_LUT, EXTRUDER_LUT,
                            motor_vol, extruder_vol, float(SAMPLE_RATE), vbuf)
         else:
-            sk.synth_motors(ns_all[sl], off, segs['v0'][sl], segs['v1'][sl],
+            synth_motors(ns_all[sl], off, segs['v0'][sl], segs['v1'][sl],
                             np.ascontiguousarray(segs['ratio'][sl]),
                             base_freq, is_extruder,
-                            phase, hist, sk.DECIM_FIR,
-                            sk.STEPPER_LUT, sk.EXTRUDER_LUT,
+                            phase, hist, DECIM_FIR,
+                            STEPPER_LUT, EXTRUDER_LUT,
                             motor_vol, extruder_vol, float(SAMPLE_RATE), vbuf)
 
-        sk.mix_voices(vbuf, n_voice, ns_all[sl], off, segs['start'][sl],
+        mix_voices(vbuf, n_voice, ns_all[sl], off, segs['start'][sl],
                       segs['v0'][sl], segs['v1'][sl], segs['x0'][sl],
                       segs['arx'][sl], segs['d0'][sl], pan_voice,
                       PAN_WIDTH_MM, float(SAMPLE_RATE), out)
@@ -333,10 +711,7 @@ def gcode_to_audio(gcode_file, output_file, printer_name=PRINTER_NAME, force_cor
     total_duration = sum(m.accel_t + m.cruise_t + m.decel_t
                          for m in moves if m.is_kinematic_move)
 
-<<<<<<< HEAD
     total_samples = int(total_duration * SAMPLE_RATE) + 100 # bit of buffer
-=======
->>>>>>> 94a1576671dc886884280d66625d7dcc0ce2ab18
     kinematics = 'corexy' if force_corexy else preset.get('kinematics', 'cartesian')
     motor_vol, extruder_vol = 0.55, 0.45
 
@@ -362,12 +737,11 @@ def gcode_to_audio(gcode_file, output_file, printer_name=PRINTER_NAME, force_cor
 
     print("Step 5: Post-processing...")
     b, a, gains = resonance_coefficients(SAMPLE_RATE)
-    sk.apply_resonance(out, b, a, gains)
+    apply_resonance(out, b, a, gains)
 
-    peak = sk.peak_abs(out)
+    peak = peak_abs(out)
     gain = np.float32(1.0 / peak) if peak > 0 else np.float32(1.0)
 
-<<<<<<< HEAD
     # Normalize and interleave in blocks straight into the file, so a long
     # print never needs a second full-length copy of the mix in RAM.
     block = 1 << 20
@@ -382,105 +756,6 @@ def gcode_to_audio(gcode_file, output_file, printer_name=PRINTER_NAME, force_cor
             buf[:n, 1] = out[1, i:j]
             buf[:n] *= gain
             f.write(buf[:n])
-=======
-        for duration, v0, v1 in phases_data:
-            if duration <= 1e-6: continue
-
-            num_samples = int(duration * SAMPLE_RATE)
-            if num_samples <= 0:
-                curr_t += duration
-                continue
-
-            s_start = curr_sample
-            s_end = s_start + num_samples
-            
-            if s_end > final_audio.shape[0]:
-                s_end = final_audio.shape[0]
-                num_samples = s_end - s_start
-                if num_samples <= 0: break
-
-            t_profile = np.linspace(0, duration, num_samples)
-            v_profile = v0 + (v1 - v0) * (t_profile / duration)
-            
-            # Cumulative distance in this phase
-            d_in_phase = np.cumsum(v_profile / SAMPLE_RATE)
-            
-            # Current X position for panning
-            phase_start_dist = dist_traveled
-            x_positions = move_start_pos[0] + axes_r[0] * (phase_start_dist + d_in_phase)
-            pan = np.clip(x_positions / 220.0, 0.1, 0.9)
-            
-            seg_mono = np.zeros(num_samples, dtype=np.float32)
-            fans_audio = psu_fan.generate_audio(num_samples) + \
-                         hotend_fan.generate_audio(num_samples) + \
-                         part_cooling_fan.generate_audio(num_samples)
-
-            OS = 4
-            OS_SR = SAMPLE_RATE * OS
-            base_freqs = {'X': 70, 'Y': 75, 'Z': 35, 'A': 70, 'B': 75, 'E': 150}
-            v_profile_os = np.linspace(v0, v1, num_samples * OS, dtype=np.float32)
-
-            if kinematics == 'delta':
-                # Tower velocities are position-dependent — compute at normal rate
-                # then interpolate up before synthesis
-                x_pos = move_start_pos[0] + axes_r[0] * (dist_traveled + d_in_phase)
-                y_pos = move_start_pos[1] + axes_r[1] * (dist_traveled + d_in_phase)
-                vx = v_profile * float(axes_r[0])
-                vy = v_profile * float(axes_r[1])
-                vz = v_profile * float(axes_r[2])
-                t_os = np.arange(num_samples * OS) * (1.0 / OS)
-                t_normal = np.arange(num_samples, dtype=np.float64)
-                for tower_key, tx, ty in delta_towers:
-                    dx = x_pos - tx
-                    dy = y_pos - ty
-                    d_vert = np.sqrt(np.maximum(_arm2 - dx**2 - dy**2, 1.0))
-                    tower_v = np.abs((-dx * vx - dy * vy) / d_vert + vz)
-                    tower_v_os = np.interp(t_os, t_normal, tower_v).astype(np.float32)
-                    freq_os = 70.0 + tower_v_os * 10
-                    phases_os = last_phases[tower_key] + np.cumsum(2 * np.pi * freq_os / OS_SR)
-                    last_phases[tower_key] = float(phases_os[-1]) % (2 * np.pi)
-                    wav_os = generate_stepper_waveform(phases_os) * motor_vol
-                    seg_mono += resample_poly(wav_os, 1, OS).astype(np.float32)[:num_samples]
-                # Extruder (independent of tower geometry)
-                e_r = abs(float(axes_r[3]))
-                if e_r > 1e-6:
-                    e_v_os = v_profile_os * e_r
-                    freq_os = 150.0 + e_v_os * 10
-                    phases_os = last_phases['E'] + np.cumsum(2 * np.pi * freq_os / OS_SR)
-                    last_phases['E'] = float(phases_os[-1]) % (2 * np.pi)
-                    wav_os = generate_extruder_waveform(phases_os) * extruder_vol
-                    seg_mono += resample_poly(wav_os, 1, OS).astype(np.float32)[:num_samples]
-            else:
-                for motor_key, motor_r in motor_ratios:
-                    motor_v_os = v_profile_os * motor_r
-                    if np.max(motor_v_os) < 1e-6: continue
-                    freq_os = base_freqs[motor_key] + motor_v_os * 10
-                    phases_os = last_phases[motor_key] + np.cumsum(2 * np.pi * freq_os / OS_SR)
-                    last_phases[motor_key] = float(phases_os[-1]) % (2 * np.pi)
-                    if motor_key == 'E':
-                        wav_os = generate_extruder_waveform(phases_os) * extruder_vol
-                    else:
-                        wav_os = generate_stepper_waveform(phases_os) * motor_vol
-                    wav = resample_poly(wav_os, 1, OS).astype(np.float32)[:num_samples]
-                    if motor_key == 'X':
-                        final_audio[s_start:s_end, 0] += wav * (1 - pan)
-                        final_audio[s_start:s_end, 1] += wav * pan
-                    else:
-                        seg_mono += wav
-            
-            final_audio[s_start:s_end, 0] += seg_mono + fans_audio
-            final_audio[s_start:s_end, 1] += seg_mono + fans_audio
-            
-            curr_t += duration
-            curr_sample += num_samples
-            dist_traveled += (v0 + v1) * 0.5 * duration
-
-    print("Step 3: Post-processing...")
-
-    max_val = np.max(np.abs(final_audio))
-    if max_val > 0: final_audio /= max_val
-    sf.write(output_file, final_audio, SAMPLE_RATE)
->>>>>>> 94a1576671dc886884280d66625d7dcc0ce2ab18
     print(f"Done: {output_file}")
 
 if __name__ == "__main__":
